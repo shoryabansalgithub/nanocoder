@@ -14,6 +14,15 @@ const PANEL_SOURCE = readFileSync(
 	'utf8',
 );
 
+// The real webview loads mention-utils.js before chat-panel.js (see
+// chat-panel.html); the panel reads globalThis.NanocoderMentionUtils at boot.
+const MENTION_UTILS_SOURCE = readFileSync(
+	fileURLToPath(
+		new URL('../../plugins/vscode/media/mention-utils.js', import.meta.url),
+	),
+	'utf8',
+);
+
 const SHELL_IDS = [
 	'add-image-btn',
 	'attach-btn',
@@ -43,9 +52,9 @@ const SHELL_IDS = [
 	'send-stop-btn',
 ];
 
-// biome-ignore lint/suspicious/noExplicitAny: the panel assigns arbitrary
-// properties (onclick, oninput, ...) to the nodes it builds, so the stub has to
-// stay open-ended.
+// The panel assigns arbitrary properties (onclick, oninput, ...) to the nodes
+// it builds, so the stub has to stay open-ended.
+// biome-ignore lint/suspicious/noExplicitAny: see above
 export type StubElement = any;
 
 /**
@@ -237,6 +246,7 @@ export function createPanel(options: {marked?: boolean} = {}) {
 	}
 
 	createContext(sandbox);
+	runInContext(MENTION_UTILS_SOURCE, sandbox);
 	runInContext(PANEL_SOURCE, sandbox);
 
 	const container = findById(root, 'messages-container') as StubElement;

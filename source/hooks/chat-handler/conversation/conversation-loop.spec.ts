@@ -1,4 +1,5 @@
 import test from 'ava';
+import {dropOrphanedToolResults} from '@/ai-sdk-client/converters/message-converter.js';
 import {clearAppConfig, getAppConfig} from '@/config/index.js';
 import {resetShutdownManager} from '@/utils/shutdown/shutdown-manager.js';
 import {processAssistantResponse, resetFallbackNotice, resetLastTurnHadReasoning} from './conversation-loop.js';
@@ -2231,6 +2232,285 @@ test.serial('repeated-tool-call limit hard-stops without prompting in non-intera
 	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
 		const params = createDefaultParams({
 			client: createRepeatingToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			nonInteractiveMode: true,
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 3, 'Loop should hard-stop at the limit');
+	t.is(questionCount, 0, 'Must not prompt when there is nobody to ask');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call'),
+	);
+	t.truthy(stopMessage, 'Should still queue the loop-detected ErrorMessage');
+});
+
+// Client that always calls a tool the tool manager does not know — this goes
+// through the unknown-tool error branch rather than tool execution.
+const createUnknownToolClient = (onChat?: () => void) => ({
+	chat: async (): Promise<LLMChatResponse> => {
+		onChat?.();
+		return {
+			choices: [
+				{
+					message: {
+						role: 'assistant',
+						content: '',
+						tool_calls: [
+							{
+								id: 'call_ghost',
+								function: {name: 'ghost_tool', arguments: '{"x": 1}'},
+							},
+						],
+					},
+				},
+			],
+			toolsDisabled: false,
+		};
+	},
+});
+
+test.serial('repeated unknown-tool calls count toward the repeated-call limit', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		t.regex(question.question, /repeated the same tool call 3 times in a row/);
+		// Stop: the safe default.
+		return question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	// The unknown-tool self-correction branch must not recurse unbounded: the
+	// third identical unknown-tool turn trips the same cap as a real call.
+	t.is(chatCallCount, 3, 'Third identical unknown-tool turn trips the limit');
+	t.is(questionCount, 1, 'Should pause and ask instead of recursing unbounded');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call 3 times in a row'),
+	);
+	t.truthy(stopMessage, 'Should queue the loop-detected ErrorMessage');
+});
+
+test.serial('repeated unknown-tool calls grant another window when the user continues', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const questionTexts: string[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		questionTexts.push(question.question);
+		// Continue on the first prompt, stop on the second.
+		return questionCount === 1 ? question.options[1] : question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 6, 'Continue should grant a full new window of turns');
+	t.is(questionCount, 2, 'Should re-prompt after the granted window is spent');
+	t.regex(questionTexts[0], /repeated the same tool call 3 times in a row/);
+	t.regex(questionTexts[1], /repeated the same tool call 6 times in a row/);
+});
+
+test.serial('unknown-tool feedback is paired with its call so it reaches the model', async t => {
+	// The error result only reaches the model when its tool_call is in the
+	// assistant message: dropOrphanedToolResults strips results whose call is
+	// missing, leaving the next turn's context unchanged and the model repeating
+	// the same ghost call until the cap trips.
+	const messageSnapshots: Message[][] = [];
+
+	setGlobalQuestionHandler(async question => question.options[0]);
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(),
+			toolManager: repeatingToolManager(),
+			setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const assistant = latest.find(m => m.role === 'assistant');
+	t.true(
+		(assistant?.tool_calls ?? []).some(tc => tc.id === 'call_ghost'),
+		'the ghost call must be in the assistant message',
+	);
+	const delivered = dropOrphanedToolResults(latest);
+	t.true(
+		delivered.some(m => m.role === 'tool' && m.tool_call_id === 'call_ghost'),
+		'the unknown-tool error must survive orphan pruning',
+	);
+});
+
+test.serial('non-interactive approval exit pairs unconfirmed tools with cancellation results', async t => {
+	const messageSnapshots: Message[][] = [];
+
+	const params = createDefaultParams({
+		client: {
+			chat: async (): Promise<LLMChatResponse> => ({
+				choices: [
+					{
+						message: {
+							role: 'assistant',
+							content: '',
+							tool_calls: [
+								{
+									id: 'call_guarded',
+									function: {name: 'guarded_tool', arguments: '{}'},
+								},
+							],
+						},
+					},
+				],
+				toolsDisabled: false,
+			}),
+		},
+		toolManager: createMockToolManager({
+			tools: ['guarded_tool'],
+			needsApproval: true,
+		}),
+		nonInteractiveMode: true,
+		setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+	});
+
+	await processAssistantResponse(params);
+
+	// The exit is terminal, so the saved history must pair the announced call
+	// with a result - a later resume would otherwise replay an assistant
+	// tool_call that never received one, which strict providers reject.
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const assistant = latest.find(m => m.role === 'assistant' && m.tool_calls);
+	t.true(
+		(assistant?.tool_calls ?? []).some(tc => tc.id === 'call_guarded'),
+		'the guarded call must be announced in the assistant message',
+	);
+	const result = latest.find(
+		m => m.role === 'tool' && m.tool_call_id === 'call_guarded',
+	);
+	t.truthy(result, 'the unconfirmed tool must get a paired result');
+	// Not the user-cancellation wording: nobody declined this tool, and a
+	// resumed interactive session must not read the history as a refusal.
+	t.regex(String(result?.content), /approval unavailable in non-interactive/i);
+	t.notRegex(String(result?.content), /cancelled by the user/i);
+});
+
+test.serial('escape mid-execution pairs the tools the confirm loop never reached', async t => {
+	const messageSnapshots: Message[][] = [];
+	const controller = new AbortController();
+
+	// Approve the first tool, then abort before it finishes so the loop breaks
+	// with the second tool still pending.
+	setGlobalToolConfirmHandler(async () => {
+		controller.abort();
+		return true;
+	});
+
+	let chatCallCount = 0;
+	const params = createDefaultParams({
+		client: {
+			chat: async (): Promise<LLMChatResponse> => {
+				chatCallCount += 1;
+				if (chatCallCount > 1) {
+					return {
+						choices: [{message: {role: 'assistant', content: 'Done.'}}],
+						toolsDisabled: false,
+					};
+				}
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{
+										id: 'call_first',
+										function: {name: 'guarded_tool', arguments: '{}'},
+									},
+									{
+										id: 'call_second',
+										function: {name: 'guarded_tool', arguments: '{}'},
+									},
+								],
+							},
+						},
+					],
+					toolsDisabled: false,
+				};
+			},
+		},
+		toolManager: createMockToolManager({
+			tools: ['guarded_tool'],
+			needsApproval: true,
+		}),
+		abortController: controller,
+		setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+	});
+
+	await processAssistantResponse(params);
+
+	setGlobalToolConfirmHandler(async () => false);
+
+	// The assistant message announces both calls, so the saved history must
+	// carry a result for the tool the abort skipped too.
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const assistant = latest.find(m => m.role === 'assistant' && m.tool_calls);
+	t.deepEqual(
+		(assistant?.tool_calls ?? []).map(tc => tc.id),
+		['call_first', 'call_second'],
+		'both calls must be announced in the assistant message',
+	);
+	for (const id of ['call_first', 'call_second']) {
+		t.truthy(
+			latest.find(m => m.role === 'tool' && m.tool_call_id === id),
+			`${id} must receive a paired tool result`,
+		);
+	}
+	const skipped = latest.find(
+		m => m.role === 'tool' && m.tool_call_id === 'call_second',
+	);
+	t.regex(String(skipped?.content), /cancelled by the user/i);
+});
+
+test.serial('repeated unknown-tool calls hard-stop without prompting in non-interactive mode', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[1];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(() => chatCallCount++),
 			toolManager: repeatingToolManager(),
 			nonInteractiveMode: true,
 			addToChatQueue: (component: any) => queuedComponents.push(component),
